@@ -485,7 +485,7 @@ shoin [FILE]
 
 ## Changelog
 
-### Unreleased
+### 0.1.4
 
 - Dragging with the mouse now selects text, the way `mouse=a` does in Vim: the
   press puts the cursor down, dragging out of it opens a charwise Visual
