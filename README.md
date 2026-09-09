@@ -485,21 +485,6 @@ shoin [FILE]
 
 ## Changelog
 
-### Unreleased
-
-- Dragging the mouse **while inserting** now selects, following Vim's
-  `-- (insert) VISUAL --`: the selection remembers the insert session it came
-  out of, and an operator (`y`, `d`, a writer verb) or `Esc` hands typing back
-  rather than dropping you in Normal. A second `Esc` leaves Insert as usual.
-  The mode names itself once in the status line on the way in, and the caret
-  takes the accent colour for as long as the selection is live — no chrome, so
-  zen mode is unaffected.
-- `:u` and `:redo` now work. Undo and redo were reachable only as `u` and
-  `Ctrl-r`; typing Vim's `:u` fell through to `not a command: u`, which is easy
-  to miss in a status line that clears after 1.5s. All of Vim's abbreviations
-  land — `:u`, `:un`, `:und`, `:undo`, `:red`, `:redo`. `:r` and `:re` stay
-  unclaimed, since `:r` is `:read` in Vim.
-
 ### 0.1.4
 
 - Dragging with the mouse now selects text, the way `mouse=a` does in Vim: the
@@ -508,6 +493,17 @@ shoin [FILE]
   and the writer verbs act on it. Text panes only — a drag begun in the file
   tree still does nothing. Set `mouse = false` (or `:set mouse off`) to hand
   selection back to the terminal.
+- Dragging **while inserting** follows Vim's `-- (insert) VISUAL --`: the
+  selection remembers the insert session it came out of, and an operator (`y`,
+  `d`, a writer verb) or `Esc` hands typing back rather than dropping you in
+  Normal. A second `Esc` leaves Insert as usual. The mode names itself once in
+  the status line on the way in, and the caret takes the accent colour for as
+  long as the selection is live — no chrome, so zen mode is unaffected.
+- `:u` and `:redo` now work. Undo and redo were reachable only as `u` and
+  `Ctrl-r`; typing Vim's `:u` fell through to `not a command: u`, which is easy
+  to miss in a status line that clears after 1.5s. All of Vim's abbreviations
+  land — `:u`, `:un`, `:und`, `:undo`, `:red`, `:redo`. `:r` and `:re` stay
+  unclaimed, since `:r` is `:read` in Vim.
 
 ### 0.1.3
 
