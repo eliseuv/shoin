@@ -488,7 +488,7 @@ shoin [FILE]
 
 ## Changelog
 
-### Unreleased
+### 0.1.5
 
 - Fixed the viewport jumping around during ordinary navigation. The scroll
   position was recomputed fresh every frame but never persisted, so it kept
