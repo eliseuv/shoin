@@ -460,6 +460,136 @@ fn task_checkbox(after_marker: &str) -> Option<bool> {
     }
 }
 
+/// The full "item under the cursor": its own `ListItem` line, any wrapped
+/// continuation lines, and every deeper-depth descendant line — one atomic
+/// unit for Alt-h/l/j/k. `None` if `line` is not inside any list item.
+pub fn item_bounds(buffer: &Buffer, kinds: &[BlockKind], line: usize) -> Option<(usize, usize)> {
+    let marker_line = nearest_item_marker_at_or_above(kinds, line)?;
+    let BlockKind::ListItem { depth, .. } = kinds[marker_line] else {
+        return None;
+    };
+    let end = item_subtree_end(buffer, kinds, marker_line, depth);
+    (line <= end).then_some((marker_line, end))
+}
+
+/// Walk upward from `line` through `Paragraph` lines only, looking for the
+/// nearest `ListItem` at or above it. Stops (fails) the moment it meets
+/// anything else — a `Blank`, a `Quote`, a `Heading`, `Table`, fence, … — or
+/// the top of the buffer. Deliberately does NOT check indentation here:
+/// `item_bounds` re-verifies membership afterward via `item_subtree_end`, so
+/// a flush-left paragraph sitting between the cursor and a distant list
+/// marker is correctly rejected there instead of duplicating that logic here.
+fn nearest_item_marker_at_or_above(kinds: &[BlockKind], line: usize) -> Option<usize> {
+    let mut i = line;
+    loop {
+        if matches!(kinds[i], BlockKind::ListItem { .. }) {
+            return Some(i);
+        }
+        if !matches!(kinds[i], BlockKind::Paragraph) || i == 0 {
+            return None;
+        }
+        i -= 1;
+    }
+}
+
+/// Forward walk from `marker_line`'s own depth, consuming every line that
+/// still belongs to its subtree: deeper `ListItem`s (children, at whatever
+/// depth — they carry their own descendants along transitively, since this
+/// loop just keeps eating anything deeper), `Paragraph` continuation lines
+/// whose indent column exceeds the item's own marker depth (the "hanging
+/// indent" signal that tells a wrapped line apart from an unrelated
+/// paragraph that happens to start right below with no blank line), and a
+/// run of `Blank` lines IFF the first non-blank line after it still belongs
+/// (a "loose list" paragraph or a nested child) — otherwise the blank run is
+/// left untouched and the subtree ends before it.
+fn item_subtree_end(buffer: &Buffer, kinds: &[BlockKind], marker_line: usize, depth: u8) -> usize {
+    let last = kinds.len().saturating_sub(1);
+    let mut end = marker_line;
+    let mut i = marker_line + 1;
+    while i <= last {
+        match &kinds[i] {
+            BlockKind::ListItem { depth: d, .. } if *d > depth => {
+                end = i;
+                i += 1;
+            }
+            BlockKind::Paragraph if leading_ws_cols(&buffer.line_text(i)) > depth as usize => {
+                end = i;
+                i += 1;
+            }
+            BlockKind::Blank => {
+                let mut j = i;
+                while j <= last && kinds[j] == BlockKind::Blank {
+                    j += 1;
+                }
+                let continues = match kinds.get(j) {
+                    Some(BlockKind::ListItem { depth: d, .. }) => *d > depth,
+                    Some(BlockKind::Paragraph) => {
+                        leading_ws_cols(&buffer.line_text(j)) > depth as usize
+                    }
+                    _ => false,
+                };
+                if !continues {
+                    break; // the blank run is NOT consumed — it stays a gap
+                }
+                end = j - 1; // include the blanks; re-enter the loop at j
+                i = j;
+            }
+            _ => break,
+        }
+    }
+    end
+}
+
+/// The previous sibling item at exactly `depth`, walking upward from
+/// `marker_line`. Tolerates deeper `ListItem`s (a sibling's own children),
+/// `Paragraph` and `Blank` lines freely while searching — it only needs to
+/// find the nearest marker, not decide membership, so it does not re-run the
+/// stricter indent/blank-lookahead test `item_subtree_end` uses. Stops (no
+/// sibling) at a shallower `ListItem` (walked past the parent) or anything
+/// that is not part of a list at all.
+pub fn prev_sibling_bounds(
+    buffer: &Buffer,
+    kinds: &[BlockKind],
+    marker_line: usize,
+    depth: u8,
+) -> Option<(usize, usize)> {
+    let mut i = marker_line;
+    while i > 0 {
+        i -= 1;
+        match &kinds[i] {
+            BlockKind::ListItem { depth: d, .. } if *d == depth => {
+                return Some((i, item_subtree_end(buffer, kinds, i, depth)));
+            }
+            BlockKind::ListItem { depth: d, .. } if *d < depth => return None,
+            BlockKind::ListItem { .. } | BlockKind::Paragraph | BlockKind::Blank => continue,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// The next sibling at exactly `depth`, walking forward from `item_end + 1`
+/// (the current item's own last line). Symmetric to `prev_sibling_bounds`.
+pub fn next_sibling_bounds(
+    buffer: &Buffer,
+    kinds: &[BlockKind],
+    item_end: usize,
+    depth: u8,
+) -> Option<(usize, usize)> {
+    let last = kinds.len().saturating_sub(1);
+    let mut i = item_end + 1;
+    while i <= last {
+        match &kinds[i] {
+            BlockKind::ListItem { depth: d, .. } if *d == depth => {
+                return Some((i, item_subtree_end(buffer, kinds, i, depth)));
+            }
+            BlockKind::ListItem { depth: d, .. } if *d < depth => return None,
+            BlockKind::ListItem { .. } | BlockKind::Paragraph | BlockKind::Blank => i += 1,
+            _ => return None,
+        }
+    }
+    None
+}
 
 impl BlockKind {
     /// Inline scanning is suppressed inside fenced code and front matter.
