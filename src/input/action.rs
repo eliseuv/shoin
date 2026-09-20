@@ -89,6 +89,12 @@ pub enum Action {
     Undo,
     Redo,
     Repeat,
+    /// `<M-h>`/`<M-l>` — indent/outdent the WHOLE list item under the
+    /// cursor (its own line, wrapped continuations, and nested children).
+    IndentItem { outdent: bool },
+    /// `<M-k>`/`<M-j>` — swap the whole list item under the cursor with its
+    /// previous/next sibling item, renumbering ordered-list siblings.
+    MoveItem { down: bool },
 
     // --- writer verbs (SPEC.md §7.3) ---
     ToggleBold,
@@ -208,6 +214,10 @@ impl Action {
             "split_horizontal" | "split" => Action::ToggleSplit { vertical: false },
             "close_pane" => Action::ClosePane,
             "only_pane" | "only" => Action::OnlyPane,
+            "indent_item" => Action::IndentItem { outdent: false },
+            "outdent_item" => Action::IndentItem { outdent: true },
+            "move_item_up" => Action::MoveItem { down: false },
+            "move_item_down" => Action::MoveItem { down: true },
             _ => {
                 if let Some(n) = name.strip_prefix("heading_") {
                     return n.parse::<u8>().ok().filter(|n| (1..=6).contains(n)).map(Action::SetHeading);

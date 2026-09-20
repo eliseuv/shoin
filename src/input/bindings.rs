@@ -39,6 +39,11 @@ pub enum Verb {
 
 /// Normal mode, first key.
 pub fn normal(key: Key) -> Option<Verb> {
+    if key.alt {
+        if let Some(v) = alt_item_verb(key.code) {
+            return Some(v);
+        }
+    }
     if let Some(m) = motion(key) {
         return Some(Verb::Motion(m));
     }
@@ -162,6 +167,22 @@ pub fn after_prefix(prefix: char, key: Key, visual_mode: bool) -> Option<Verb> {
         // `<C-w>` hands its second key straight to the window commands, so a
         // pane verb can be added without touching the grammar.
         ('w', c) => Verb::Act(Action::Window(c)),
+        _ => return None,
+    })
+}
+
+/// `<M-h>`/`<M-j>`/`<M-k>`/`<M-l>` — item indent/outdent/move. Checked
+/// before `motion()` so they never fall through to plain h/j/k/l: `motion()`
+/// keys every arm off `key.ctrl` only, so it would otherwise treat
+/// `<M-h>` as bare `h`. Alt instead of Ctrl: on terminals without the kitty
+/// keyboard protocol, `<C-h>`/`<C-j>` can arrive as the same bytes as
+/// Backspace/Enter.
+fn alt_item_verb(code: KeyCode) -> Option<Verb> {
+    Some(match code {
+        KeyCode::Char('h') => Verb::Act(Action::IndentItem { outdent: true }),
+        KeyCode::Char('l') => Verb::Act(Action::IndentItem { outdent: false }),
+        KeyCode::Char('k') => Verb::Act(Action::MoveItem { down: false }),
+        KeyCode::Char('j') => Verb::Act(Action::MoveItem { down: true }),
         _ => return None,
     })
 }
