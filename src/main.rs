@@ -149,6 +149,7 @@ fn main() -> Result<()> {
     let mut terminal = ratatui::init();
     use ratatui::crossterm::event::{
         DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     };
     if mouse {
         let _ = ratatui::crossterm::execute!(std::io::stdout(), EnableMouseCapture);
@@ -160,7 +161,24 @@ fn main() -> Result<()> {
     // does not implement it simply never sends the event (the 1-second poll
     // covers that case).
     let _ = ratatui::crossterm::execute!(std::io::stdout(), EnableFocusChange);
+    // Without this, a terminal has to guess whether `Esc` followed by a byte
+    // is Alt/Ctrl+that-key or two separate keystrokes — and that guess is
+    // wrong often enough in practice (e.g. Ctrl+h arriving indistinguishable
+    // from Backspace) that Normal-mode Ctrl bindings on ambiguous keys can
+    // silently misfire. A terminal that does not support the protocol simply
+    // never answers the query, so this is unconditional the same way focus
+    // reporting is.
+    let kitty_keyboard = ratatui::crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    if kitty_keyboard {
+        let _ = ratatui::crossterm::execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+    }
     let result = app.run_loop(&mut terminal);
+    if kitty_keyboard {
+        let _ = ratatui::crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    }
     let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableFocusChange);
     let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
