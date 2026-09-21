@@ -35,7 +35,7 @@ use crate::render::focus::{FocusMode, FocusRegion};
 use crate::render::numbers::NumberMode;
 use crate::render::pane::{Dir, Node, Pane, PaneId};
 use crate::render::frame;
-use crate::render::markdown::block::{BlockCache, BlockKind, Marker};
+use crate::render::markdown::block::{self, BlockCache, BlockKind, Marker};
 use crate::render::markdown::inline::{self, Inline};
 use crate::render::theme::Theme;
 use crate::fs::ops;
@@ -1720,6 +1720,8 @@ impl App {
             Action::ToggleCode => self.writer_toggle("`"),
             Action::ToggleTask => self.toggle_task(),
             Action::InsertLink => self.wrap_link(),
+            Action::IndentItem { outdent } => self.indent_item(outdent),
+            Action::MoveItem { down } => self.move_item(down),
             Action::SetHeading(n) => self.set_heading(n),
             Action::ClearHeading => self.set_heading(0),
             Action::CycleFocus => {
@@ -3410,6 +3412,209 @@ impl App {
         }
     }
 
+    /// The list item under the cursor — its own line, wraps, and descendants
+    /// — or `None` when the cursor is not inside one. Refreshes the block
+    /// cache first: `self.blocks` can still describe the pre-edit buffer
+    /// between two keys in one batch (same guard as `toggle_task`,
+    /// `newline_with_indent`).
+    fn current_item_bounds(&mut self) -> Option<(usize, usize)> {
+        self.refresh_blocks();
+        block::item_bounds(&self.buffer, &self.blocks.kinds, self.buffer.cursor.line)
+    }
+
+    /// Absolute char range for whole lines `l1..=l2`, mirroring the inline
+    /// logic `operate_linewise` uses for a single line range.
+    fn line_span_chars(&self, l1: usize, l2: usize) -> (usize, usize) {
+        let last = self.buffer.line_count().saturating_sub(1);
+        let start = self.buffer.rope.line_to_char(l1);
+        let end = if l2 < last {
+            self.buffer.rope.line_to_char(l2 + 1)
+        } else {
+            self.buffer.rope.len_chars()
+        };
+        (start, end)
+    }
+
+    /// `<M-h>`/`<M-l>` — indent/outdent the WHOLE list item under the cursor
+    /// (its own line, wrapped continuations, and nested children) one level.
+    fn indent_item(&mut self, outdent: bool) {
+        let Some((s, e)) = self.current_item_bounds() else { return };
+        let BlockKind::ListItem { depth: old_depth, marker: old_marker, .. } = self.blocks.kinds[s].clone()
+        else {
+            return;
+        };
+        // Capture a same-depth neighbor BEFORE the shift, so its group (now
+        // missing this item) can still be found and renumbered afterward.
+        let old_neighbor = block::prev_sibling_bounds(&self.buffer, &self.blocks.kinds, s, old_depth)
+            .or_else(|| block::next_sibling_bounds(&self.buffer, &self.blocks.kinds, e, old_depth))
+            .map(|(l, _)| l);
+
+        let cursor = self.buffer.cursor;
+        self.shift_lines(s, e, outdent);
+        self.buffer.cursor = Cursor::new(cursor.line, self.first_non_blank(cursor.line));
+
+        self.renumber_after_item_move(old_marker, old_depth, old_neighbor, s);
+    }
+
+    /// `<M-k>`/`<M-j>` — swap the whole list item under the cursor with its
+    /// previous/next sibling item (same depth), renumbering ordered-list
+    /// siblings afterward. No-op with no such sibling.
+    fn move_item(&mut self, down: bool) {
+        let Some((s, e)) = self.current_item_bounds() else { return };
+        let BlockKind::ListItem { depth, .. } = self.blocks.kinds[s].clone() else { return };
+
+        let sibling = if down {
+            block::next_sibling_bounds(&self.buffer, &self.blocks.kinds, e, depth)
+        } else {
+            block::prev_sibling_bounds(&self.buffer, &self.blocks.kinds, s, depth)
+        };
+        let Some((ps, pe)) = sibling else { return };
+
+        let ((a1, a2), (b1, b2)) = if s < ps { ((s, e), (ps, pe)) } else { ((ps, pe), (s, e)) };
+        let current_is_early = s == a1;
+
+        let (a_start, a_end) = self.line_span_chars(a1, a2);
+        let (b_start, b_end) = self.line_span_chars(b1, b2);
+        let text_a = self.buffer.rope.slice(a_start..a_end).to_string();
+        let text_b = self.buffer.rope.slice(b_start..b_end).to_string();
+        let gap_text = if b1 > a2 + 1 {
+            let (gs, ge) = self.line_span_chars(a2 + 1, b1 - 1);
+            self.buffer.rope.slice(gs..ge).to_string()
+        } else {
+            String::new()
+        };
+
+        let cursor = self.buffer.cursor;
+        let offset_in_item = cursor.line - s;
+        let col = cursor.col;
+
+        self.buffer.delete_chars(a_start, b_end);
+        let mut combined = String::with_capacity(text_a.len() + text_b.len() + gap_text.len());
+        combined.push_str(&text_b);
+        combined.push_str(&gap_text);
+        combined.push_str(&text_a);
+        let insert_at = self.idx_to_cursor(a_start);
+        self.buffer.insert_str(insert_at, &combined);
+
+        let gap_lines = b1.saturating_sub(a2 + 1);
+        let new_marker_line = if current_is_early {
+            a1 + (b2 - b1 + 1) + gap_lines
+        } else {
+            a1
+        };
+        self.buffer.cursor = Cursor::new(new_marker_line + offset_in_item, col);
+
+        self.refresh_blocks();
+        if let Some(BlockKind::ListItem { marker: Marker::Ordered, .. }) = self.blocks.kinds.get(new_marker_line) {
+            let members = self.ordered_group(new_marker_line, depth);
+            self.renumber_ordered_group(&members);
+        }
+    }
+
+    /// Rewrite an `Ordered` item's leading digit run to `n`, leaving its
+    /// delimiter (`.`/`)`), indent, and any checkbox suffix untouched.
+    fn rewrite_ordinal(&mut self, line: usize, n: usize) {
+        let text = self.buffer.line_text(line);
+        let indent_len = text.chars().take_while(|c| *c == ' ' || *c == '\t').count();
+        let body = &text[indent_len..];
+        let digits: String = body.chars().take_while(char::is_ascii_digit).collect();
+        if digits.parse::<usize>().ok() == Some(n) {
+            return; // already correct — skip the no-op edit
+        }
+        let base = self.buffer.rope.line_to_char(line);
+        let start = base + indent_len;
+        let end = start + digits.chars().count();
+        self.buffer.delete_chars(start, end);
+        let at = self.idx_to_cursor(start);
+        self.buffer.insert_str(at, &n.to_string());
+    }
+
+    /// Every same-depth `Ordered` sibling of `member`, both directions,
+    /// stopping the moment a same-depth sibling is a DIFFERENT marker
+    /// (CommonMark: a different bullet style starts a new list).
+    fn ordered_group(&mut self, member: usize, depth: u8) -> Vec<usize> {
+        let mut members = vec![member];
+        let mut cur = member;
+        while let Some((ps, _)) = block::prev_sibling_bounds(&self.buffer, &self.blocks.kinds, cur, depth) {
+            if !matches!(self.blocks.kinds[ps], BlockKind::ListItem { marker: Marker::Ordered, .. }) {
+                break;
+            }
+            members.push(ps);
+            cur = ps;
+        }
+        let mut cur_end = block::item_bounds(&self.buffer, &self.blocks.kinds, member)
+            .map(|(_, e)| e)
+            .unwrap_or(member);
+        while let Some((ns, ne)) = block::next_sibling_bounds(&self.buffer, &self.blocks.kinds, cur_end, depth) {
+            if !matches!(self.blocks.kinds[ns], BlockKind::ListItem { marker: Marker::Ordered, .. }) {
+                break;
+            }
+            members.push(ns);
+            cur_end = ne;
+        }
+        members.sort_unstable();
+        members
+    }
+
+    /// Renumber `members` sequentially, preserving the group's ORIGINAL
+    /// starting number. `members[0]` (lowest LINE number, not necessarily
+    /// the item that originally led the sequence) may already carry a
+    /// different, un-rewritten digit than where the group actually started —
+    /// e.g. after moving `1.` below `2.`, the physically-first line still
+    /// reads `2.` at this point — so the true start is the MINIMUM digit
+    /// across every member, not `members[0]`'s alone.
+    fn renumber_ordered_group(&mut self, members: &[usize]) {
+        if members.is_empty() {
+            return;
+        }
+        let n0 = members
+            .iter()
+            .filter_map(|&l| {
+                self.buffer
+                    .line_text(l)
+                    .trim_start()
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse::<usize>()
+                    .ok()
+            })
+            .min()
+            .unwrap_or(1);
+        for (i, &line) in members.iter().enumerate() {
+            self.rewrite_ordinal(line, n0 + i);
+        }
+    }
+
+    /// After `indent_item` shifts an item to a new depth, renumber both the
+    /// sibling group it left (`old_neighbor`, at `old_depth`) and the one it
+    /// joined (at `new_marker_line`'s current depth) — but only when the
+    /// item itself is `Ordered`, since a bullet item's move never touches
+    /// numbering.
+    fn renumber_after_item_move(
+        &mut self,
+        old_marker: Marker,
+        old_depth: u8,
+        old_neighbor: Option<usize>,
+        new_marker_line: usize,
+    ) {
+        self.refresh_blocks();
+        if matches!(old_marker, Marker::Ordered) {
+            if let Some(nl) = old_neighbor {
+                if matches!(self.blocks.kinds.get(nl), Some(BlockKind::ListItem { marker: Marker::Ordered, .. })) {
+                    let members = self.ordered_group(nl, old_depth);
+                    self.renumber_ordered_group(&members);
+                }
+            }
+        }
+        if let Some(BlockKind::ListItem { depth: new_depth, marker: Marker::Ordered, .. }) =
+            self.blocks.kinds.get(new_marker_line).cloned()
+        {
+            let members = self.ordered_group(new_marker_line, new_depth);
+            self.renumber_ordered_group(&members);
+        }
+    }
+
     /// Column of the first non-blank character on `line`.
     fn first_non_blank(&self, line: usize) -> usize {
         self.buffer
@@ -4635,6 +4840,14 @@ mod tests {
     fn feed(app: &mut App, keys: &str) {
         for c in keys.chars() {
             app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+            app.sync_after_input();
+        }
+    }
+
+    /// Feed Ctrl-modified character keys, one per char.
+    fn feed_ctrl(app: &mut App, keys: &str) {
+        for c in keys.chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
             app.sync_after_input();
         }
     }
@@ -6294,6 +6507,66 @@ mod tests {
         // `>ip` is linewise over the paragraph and skips the blank line.
         feed(&mut app, ">ip");
         assert_eq!(text(&app), "    one\n    two\n\nthree\n");
+    }
+
+    #[test]
+    fn ctrl_h_l_indent_and_outdent_a_bullet_item() {
+        let mut app = app_with("- one\n- two\n");
+        feed_ctrl(&mut app, "l");
+        assert_eq!(text(&app), "    - one\n- two\n");
+        feed_ctrl(&mut app, "h");
+        assert_eq!(text(&app), "- one\n- two\n");
+    }
+
+    #[test]
+    fn ctrl_l_carries_nested_children_along() {
+        let mut app = app_with("- parent\n  - child\n- next\n");
+        feed_ctrl(&mut app, "l");
+        assert_eq!(text(&app), "    - parent\n      - child\n- next\n");
+    }
+
+    #[test]
+    fn ctrl_k_j_swap_sibling_bullet_items() {
+        let mut app = app_with("- one\n- two\n- three\n");
+        app.buffer.cursor = Cursor::new(1, 0); // on "- two"
+        feed_ctrl(&mut app, "k");
+        assert_eq!(text(&app), "- two\n- one\n- three\n");
+        assert_eq!(app.buffer.cursor.line, 0);
+        feed_ctrl(&mut app, "j");
+        assert_eq!(text(&app), "- one\n- two\n- three\n");
+    }
+
+    #[test]
+    fn ctrl_j_renumbers_ordered_siblings_after_a_move() {
+        // Moving "1. a" below "2. b" leaves "2. b" physically first (still
+        // carrying its un-rewritten "2") — renumbering must use the MIN
+        // digit across members (1), not the physically-first line's own
+        // digit (2), or this would come out "2. b / 3. a / 4. c" instead.
+        let mut app = app_with("1. a\n2. b\n3. c\n");
+        app.buffer.cursor = Cursor::new(0, 0);
+        feed_ctrl(&mut app, "j");
+        assert_eq!(text(&app), "1. b\n2. a\n3. c\n");
+    }
+
+    #[test]
+    fn ctrl_j_moves_an_item_with_a_wrapped_continuation_line() {
+        let mut app = app_with("- one\n  wraps here\n- two\n");
+        app.buffer.cursor = Cursor::new(0, 0);
+        feed_ctrl(&mut app, "j");
+        assert_eq!(text(&app), "- two\n- one\n  wraps here\n");
+    }
+
+    #[test]
+    fn ctrl_k_j_h_are_a_noop_at_the_edges_of_a_list() {
+        let mut app = app_with("- one\n- two\n");
+        app.buffer.cursor = Cursor::new(0, 0);
+        feed_ctrl(&mut app, "k"); // no previous sibling
+        assert_eq!(text(&app), "- one\n- two\n");
+        app.buffer.cursor = Cursor::new(1, 0);
+        feed_ctrl(&mut app, "j"); // no next sibling
+        assert_eq!(text(&app), "- one\n- two\n");
+        feed_ctrl(&mut app, "h"); // already at depth 0 — shift_lines itself no-ops
+        assert_eq!(text(&app), "- one\n- two\n");
     }
 
     #[test]

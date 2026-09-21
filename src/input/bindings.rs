@@ -44,6 +44,10 @@ pub fn normal(key: Key) -> Option<Verb> {
     }
     let ctrl = key.ctrl;
     Some(match (key.code, ctrl) {
+        (KeyCode::Char('h'), true) => Verb::Act(Action::IndentItem { outdent: true }),
+        (KeyCode::Char('l'), true) => Verb::Act(Action::IndentItem { outdent: false }),
+        (KeyCode::Char('k'), true) => Verb::Act(Action::MoveItem { down: false }),
+        (KeyCode::Char('j'), true) => Verb::Act(Action::MoveItem { down: true }),
         (KeyCode::Char('G'), false) => Verb::Goto(Motion::BufferEnd),
         (KeyCode::Char('d'), false) => Verb::Operator(Operator::Delete),
         (KeyCode::Char('c'), false) => Verb::Operator(Operator::Change),

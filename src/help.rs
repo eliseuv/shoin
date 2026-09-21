@@ -187,6 +187,8 @@ const BINDINGS: &[&str] = &[
     "  d  delete      c  change      y  yank",
     "  dd cc yy       whole line     d$  dw  dj  ...  over a motion",
     "  >  <           indent / outdent lines   (>> << ,  >ip)",
+    "  <C-h> <C-l>    indent / outdent the WHOLE list item under the cursor",
+    "  <C-k> <C-j>    move it up / down, swapping with a sibling item",
     "  gu gU          lowercase / uppercase    (guiw, gUU)",
     "  D  C  Y        to end of line",
     "  x  X           delete char under / before the cursor",
